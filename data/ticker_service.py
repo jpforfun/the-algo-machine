@@ -49,7 +49,7 @@ MAX_RECONNECT_ATTEMPTS = 10
 # DATA STRUCTURES
 # ================================================================
 
-@dataclass
+@dataclass(kw_only=True)
 class DepthLevel:
     """Single order book depth level."""
     price: float
@@ -57,7 +57,7 @@ class DepthLevel:
     orders: int = 0
 
 
-@dataclass
+@dataclass(kw_only=True)
 class OrderBookDepth:
     """Full order book depth (top 5 levels each side)."""
     bids: List[DepthLevel] = field(default_factory=list)
@@ -65,7 +65,7 @@ class OrderBookDepth:
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-@dataclass
+@dataclass(kw_only=True)
 class TickData:
     """Processed tick data with computed features."""
     instrument_token: int

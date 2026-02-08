@@ -69,7 +69,7 @@ RANKING_CACHE_TTL_SEC = 1.0
 # DATA STRUCTURES
 # ================================================================
 
-@dataclass
+@dataclass(kw_only=True)
 class MicrostructureSnapshot:
     """
     Point-in-time microstructure features for a single instrument.

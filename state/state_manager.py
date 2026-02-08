@@ -21,6 +21,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
+from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -57,6 +58,8 @@ class OrderStatus(str, Enum):
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
     MODIFYING = "MODIFYING"
+    CANCEL_PENDING = "CANCEL_PENDING"
+    FALLBACK_TRIGGERED = "FALLBACK_TRIGGERED"
 
 class PositionSide(str, Enum):
     """Position side enumeration."""
@@ -77,7 +80,8 @@ class RiskFlag(str, Enum):
     MAX_CONSECUTIVE_LOSSES = "MAX_CONSECUTIVE_LOSSES"
     SYSTEM_ERROR = "SYSTEM_ERROR"
 
-class Order(NamedTuple):
+@dataclass(kw_only=True)
+class Order:
     """Order data model."""
     order_id: str
     symbol: str
@@ -93,7 +97,8 @@ class Order(NamedTuple):
     parent_order_id: Optional[str] = None
     tags: Optional[Dict[str, Any]] = None
 
-class Position(NamedTuple):
+@dataclass(kw_only=True)
+class Position:
     """Position data model."""
     position_id: str
     symbol: str
@@ -110,7 +115,8 @@ class Position(NamedTuple):
     unrealized_pnl: float = 0.0
     tags: Optional[Dict[str, Any]] = None
 
-class PnLRecord(NamedTuple):
+@dataclass(kw_only=True)
+class PnLRecord:
     """PnL record data model."""
     record_id: str
     date: str  # YYYY-MM-DD
@@ -120,7 +126,8 @@ class PnLRecord(NamedTuple):
     timestamp: datetime
     position_ids: List[str]
 
-class StateSnapshot(NamedTuple):
+@dataclass(kw_only=True)
+class StateSnapshot:
     """Complete state snapshot."""
     positions: List[Position]
     open_orders: List[Order]
@@ -145,7 +152,7 @@ INIT_SQL = f"""
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
-PRAGMA busy_timeout = 5000;
+PRAGMA busy_timeout = 3000;
 
 -- Schema version tracking
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -201,7 +208,8 @@ CREATE TABLE IF NOT EXISTS orders (
     trigger_price REAL,
     status TEXT NOT NULL CHECK (status IN (
         'PENDING', 'OPEN', 'PARTIAL_FILL', 'COMPLETE', 
-        'CANCELLED', 'REJECTED', 'MODIFYING'
+        'CANCELLED', 'REJECTED', 'MODIFYING', 
+        'CANCEL_PENDING', 'FALLBACK_TRIGGERED'
     )),
     order_timestamp TIMESTAMP NOT NULL,
     last_updated TIMESTAMP NOT NULL,
@@ -311,6 +319,8 @@ class ConnectionPool:
                     conn.row_factory = sqlite3.Row
                     conn.execute("PRAGMA foreign_keys = ON")
                     conn.execute("PRAGMA journal_mode = WAL")
+                    conn.execute("PRAGMA synchronous = NORMAL")
+                    conn.execute("PRAGMA busy_timeout = 3000")
                     self._local.connection = conn
                     self._all_connections[thread_id] = conn  # Track for close_all
                     logger.debug(f"Created new connection for thread {thread_id}")

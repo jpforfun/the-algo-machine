@@ -27,7 +27,7 @@ class Settings(BaseSettings):
         env_file='.env',
         env_file_encoding='utf-8',
         case_sensitive=False,
-        extra='forbid',  # Reject unknown fields
+        extra='ignore',  # Allow unknown fields for robustness
         frozen=True,     # Prevent mutation after creation
     )
     
@@ -104,6 +104,34 @@ class Settings(BaseSettings):
         le=1.0,
         description="Weight for Momentum score in ranking (0.0-1.0)"
     )
+
+    signal_cooldown_sec: int = Field(
+        default=60,
+        ge=0,
+        le=3600,
+        description="Per-symbol cooldown between execution signals (seconds)"
+    )
+
+    alpha_poll_interval_ms: int = Field(
+        default=500,
+        ge=100,
+        le=5000,
+        description="Polling interval for alpha decision loop (milliseconds)"
+    )
+
+    market_data_stale_threshold_sec: float = Field(
+        default=2.0,
+        ge=0.1,
+        le=10.0,
+        description="Threshold for considering market data snapshots as stale (seconds)"
+    )
+
+    execution_tick_size: float = Field(
+        default=0.05,
+        ge=0.01,
+        le=1.0,
+        description="Minimum tick size for price rounding (e.g., 0.05 for NSE Equity)"
+    )
     
     nifty50_symbols: Set[str] = Field(
         default={
@@ -148,6 +176,24 @@ class Settings(BaseSettings):
     )
 
     # ================================================================
+    # TRANSACTION COST & ALPHA SETTINGS
+    # ================================================================
+    
+    estimated_transaction_cost_bps: float = Field(
+        default=20.0,
+        ge=5.0,
+        le=50.0,
+        description="Conservative round-trip transaction cost estimate in basis points (0.20% default)"
+    )
+    
+    alpha_horizon_minutes: int = Field(
+        default=5,
+        ge=5,
+        le=15,
+        description="Target alpha signal horizon in minutes (5 or 15)"
+    )
+    
+    # ================================================================
     # RISK MANAGEMENT SETTINGS (DEPRECATED: Use RISK LIMITS below)
     # ================================================================
 
@@ -183,6 +229,36 @@ class Settings(BaseSettings):
     # ================================================================
     # RISK LIMITS - POSITION LEVEL
     # ================================================================
+    
+    # Base risk per trade (as % of capital)
+    base_risk_per_trade_pct: float = Field(
+        default=1.0,
+        ge=0.1,
+        le=5.0,
+        description="Base risk allocation per trade as % of capital (default 1%)"
+    )
+    
+    # Regime-based risk multipliers
+    risk_multiplier_trending: float = Field(
+        default=1.5,
+        ge=0.5,
+        le=2.0,
+        description="Risk multiplier for TRENDING regime"
+    )
+    
+    risk_multiplier_choppy: float = Field(
+        default=0.5,
+        ge=0.1,
+        le=1.0,
+        description="Risk multiplier for CHOPPY regime"
+    )
+    
+    risk_multiplier_high_vol: float = Field(
+        default=0.75,
+        ge=0.25,
+        le=1.5,
+        description="Risk multiplier for HIGH_VOL regime"
+    )
     
     max_positions: int = Field(
         default=5,
@@ -354,10 +430,10 @@ class Settings(BaseSettings):
     )
     
     entry_alpha_threshold: float = Field(
-        default=0.65,
+        default=0.75,  # INCREASED from 0.65 for turnover control
         ge=0.5,
         le=0.95,
-        description="Minimum composite alpha score for trade entry"
+        description="Minimum composite alpha score for trade entry (cost-aware threshold)"
     )
     
     urgent_alpha_threshold: float = Field(
@@ -835,33 +911,9 @@ def load_settings() -> Settings:
 
 
 def get_settings() -> Settings:
-    """
-    Get or create the global settings singleton.
-    
-    This is the recommended way to access configuration throughout the application.
-    Thread-safe and lazy-loads on first access.
-    
-    Returns:
-        Settings instance
-        
-    Raises:
-        RuntimeError: If settings cannot be loaded
-    """
-    global _settings, _settings_lock
-    
-    if _settings is None:
-        # Lazy import to avoid circular dependencies
-        import threading
-        
-        if _settings_lock is None:
-            _settings_lock = threading.Lock()
-        
-        with _settings_lock:
-            # Double-check pattern
-            if _settings is None:
-                _settings = load_settings()
-    
-    return _settings
+    s = Settings()
+    print("DEBUG SETTINGS FIELDS:", s.model_fields.keys())
+    return s
 
 
 def reset_settings() -> None:

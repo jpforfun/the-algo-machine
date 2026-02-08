@@ -11,14 +11,14 @@ import signal
 import time
 import threading
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, TYPE_CHECKING
 from datetime import datetime, timezone, timedelta
 
 from config.config import get_settings
-from state.state_manager import StateManager, OrderStatus, OrderSide, RiskFlag, RiskFlag
+from state.state_manager import StateManager, OrderStatus, OrderSide, RiskFlag
 from data.ticker_service import TickerService, create_ticker_service
 from features.microstructure_features import MicrostructureFeatureEngine, MicrostructureSnapshot
-from strategy.cross_sectional_ranker import CrossSectionalRanker
+from strategy.cross_sectional_ranker import CrossSectionalRanker, RegimeState
 from alpha.alpha_engine import AlphaEngine
 from risk.risk_manager import RiskManager
 from execution.execution_engine import ExecutionEngine
@@ -31,12 +31,15 @@ except ImportError:
         def __init__(self, *args, **kwargs): pass
     logging.warning("KiteConnect not installed. TradingEngine using mock.")
 
+if TYPE_CHECKING:
+    from kiteconnect import KiteConnect
+
 logger = logging.getLogger(__name__)
 
 # IST Timezone for NSE
 IST = timezone(timedelta(hours=5, minutes=30))
 
-@dataclass
+@dataclass(kw_only=True)
 class TradeIntent:
     """Decoupled record of a trading decision from AlphaEngine."""
     symbol: str
@@ -65,23 +68,21 @@ class SignalGate:
         with self._lock:
             if symbol in self._in_flight:
                 return False
-            
             last_time = self._last_signal_time.get(symbol, 0)
             if time.monotonic() - last_time < self._cooldown_sec:
                 return False
-                
             return True
 
     def mark_in_flight(self, symbol: str):
         """Register that a signal is being processed."""
         with self._lock:
             self._in_flight.add(symbol)
-            self._last_signal_time[symbol] = time.monotonic()
 
     def clear_in_flight(self, symbol: str):
-        """Unregister after execution attempt (success or failure)."""
+        """Unregister after execution attempt (success or failure). Update cooldown timestamp."""
         with self._lock:
             self._in_flight.discard(symbol)
+            self._last_signal_time[symbol] = time.monotonic()
 
 class TradingEngine:
     """
@@ -112,7 +113,7 @@ class TradingEngine:
         )
         
         # 4. Safety Gates
-        self.signal_gate = SignalGate(cooldown_sec=self.settings.order_ttl_sec or 60)
+        self.signal_gate = SignalGate(cooldown_sec=self.settings.signal_cooldown_sec)
         self.intent_queue: asyncio.Queue[TradeIntent] = asyncio.Queue(maxsize=100)
 
         # 4.1 Mode Enforcement (🛡️ Safety Improvement)
@@ -220,7 +221,7 @@ class TradingEngine:
         """
         self.logger.info("Starting Alpha Decision Loop...")
         
-        poll_interval = getattr(self.settings, 'alpha_poll_interval_ms', 500) / 1000.0
+        poll_interval = self.settings.alpha_poll_interval_ms / 1000.0
         
         while not self._stop_event.is_set():
             start_time = time.monotonic()
@@ -243,21 +244,37 @@ class TradingEngine:
                     continue
                 
                 # 4. Consistency Freeze: Capture ranks once per cycle
-                ranker_snapshot = dict(self.ranker._ranks)
+                ranker_snapshot = self.ranker.get_rank_snapshot()
                 
                 # 5. Process each instrument
                 for token, snap in snapshots.items():
                     # A. Fetch rank from frozen snapshot
                     rank_res = ranker_snapshot.get(token)
                     
-                    # B. Get Regime Probability (Placeholder)
-                    regime_prob = 1.0 
+                    # B. Get Regime State & Prob
+                    regime_state = self.ranker.get_regime_state(snap.symbol)
+                    regime_prob = self.ranker.get_regime_prob(snap.symbol)
+                    if regime_prob is None or not (0.0 <= regime_prob <= 1.0):
+                        self.logger.debug(f"Skipping {snap.symbol}: invalid regime_prob={regime_prob}")
+                        continue
                     
+                    # 🔴 CHOPPY BLOCK (Log & Skip)
+                    if regime_state == RegimeState.CHOPPY:
+                        # Optional: Log occasionally or debug
+                        # self.logger.debug(f"Skipping {snap.symbol}: CHOPPY regime")
+                        continue
+
                     # C. Compute Alpha Score
                     alpha = self.alpha_engine.compute_alpha(snap, rank_res, regime_prob)
                     
+                    # 🔴 COST VETO (Log & Skip)
+                    if alpha.cost_vetoed:
+                        self.logger.info(f"Signal vetoed by cost: {snap.symbol} "
+                                       f"raw={alpha.raw_score:.3f} effective={alpha.effective_alpha:.3f}")
+                        continue
+                    
                     # D. Evaluate Signal and Queue Intent
-                    await self._evaluate_signal(snap, alpha)
+                    await self._evaluate_signal(snap, alpha, regime_state, rank_res)
                 
                 # 6. Dynamic sleep using monotonic time
                 elapsed = time.monotonic() - start_time
@@ -269,33 +286,54 @@ class TradingEngine:
                 self.logger.error(f"Error in alpha decision loop: {e}", exc_info=True)
                 await asyncio.sleep(1)
 
-    async def _evaluate_signal(self, snap: MicrostructureSnapshot, alpha: Any):
-        """Translates alpha signals into TradeIntents."""
+    async def _evaluate_signal(self, snap: MicrostructureSnapshot, alpha: Any, 
+                              regime: RegimeState, rank: Optional[RankResult] = None):
         symbol = snap.symbol
-        
-        # Gate Check: Cooldown and In-Flight prevention
-        if not self.signal_gate.can_proceed(symbol):
-            return
-
         positions = self.state_manager.get_open_positions(symbol)
+        if len(positions) > 1:
+            self.logger.critical(f"Multiple open positions detected for {symbol}")
+            return
         active_pos = positions[0] if positions else None
-        
         intent = None
+        
+        # Determine z_score for attribution
+        z_score = rank.z_score if rank else 0.0
         
         # 1. Entry Logic
         if alpha.is_entry and not active_pos:
             side = 'BUY' if alpha.signal > 0 else 'SELL'
             # Check if we already have pending orders in DB (backup for Gate)
             if not self.state_manager.get_open_orders(symbol):
-                intent = TradeIntent(
-                    symbol=symbol, side=side, 
-                    quantity=self.settings.default_order_quantity,
-                    snapshot=snap, 
-                    alpha=alpha.score,
-                    rank=alpha.comp_rank, # Storing raw rank normalized score for now
-                    is_pegged=True, urgent=False,
-                    tag=f"alpha_entry_{alpha.signal}"
+                
+                # Calculate Position Size (Patched Logic)
+                total_capital = self.settings.total_capital 
+                
+                qty = self.risk_manager.calculate_position_size(
+                    symbol=symbol,
+                    regime=regime,
+                    snapshot=snap,
+                    total_capital=total_capital
                 )
+                
+                if qty and qty > 0:
+                    # User-requested intent construction (🛡️ Logic Improvement)
+                    intent = TradeIntent(
+                        symbol=symbol,
+                        side=side,
+                        quantity=qty,
+                        snapshot=snap,
+                        alpha=alpha.score,
+                        rank=z_score,
+                        is_pegged=(
+                            alpha.signal == 1 and
+                            alpha.effective_alpha > 0.15 and
+                            regime == RegimeState.TRENDING
+                        ),
+                        urgent=False,
+                        tag=f"alpha_entry_{alpha.signal}_regime_{regime.value}"
+                    )
+                else:
+                    self.logger.warning(f"Position sizing rejected entry for {symbol} (qty={qty})")
         
         # 2. Exit Logic
         elif alpha.is_exit and active_pos:
@@ -306,7 +344,7 @@ class TradingEngine:
                     quantity=abs(active_pos.quantity),
                     snapshot=snap,
                     alpha=alpha.score,
-                    rank=alpha.comp_rank,
+                    rank=z_score,
                     is_pegged=False, urgent=True,
                     tag="alpha_exit"
                 )
@@ -330,13 +368,13 @@ class TradingEngine:
             try:
                 # Wait for next intent
                 intent = await asyncio.wait_for(self.intent_queue.get(), timeout=1.0)
-                
-                # Process Execute
+                if self.state_manager.is_trading_halted():
+                    self.logger.critical("Trading halted during execution worker. Skipping intent.")
+                    self.intent_queue.task_done()
+                    self.signal_gate.clear_in_flight(intent.symbol)
+                    continue
                 try:
                     self.logger.info(f"Worker Processing {intent.side} {intent.symbol}...")
-                    
-                    # Final feedback loop check before hitting ExecutionEngine
-                    # ExecutionEngine also has pre-trade risk checks
                     local_id = self.execution.place_order(
                         symbol=intent.symbol,
                         side=intent.side,
@@ -348,17 +386,13 @@ class TradingEngine:
                         alpha=intent.alpha,
                         rank=intent.rank
                     )
-                    
                     if local_id:
                         self.logger.info(f"Order Placed successfully: {local_id}")
                     else:
                         self.logger.warning(f"Order Placement REJECTED by ExecutionEngine for {intent.symbol}")
-                
                 finally:
-                    # Always clear signal gate to allow next signal after cooldown
                     self.intent_queue.task_done()
                     self.signal_gate.clear_in_flight(intent.symbol)
-
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
@@ -384,7 +418,7 @@ class TradingEngine:
                                second=0, microsecond=0)
         end_time -= timedelta(minutes=self.settings.no_trade_end_minutes)
         
-        return start_time <= now <= end_time
+        return start_time <= now < end_time
 
     async def _session_management_loop(self):
         """Handles market open/close events and auto-flattening."""
@@ -425,12 +459,14 @@ class TradingEngine:
             side = 'SELL' if pos.quantity > 0 else 'BUY'
             self.logger.info(f"Flattening {pos.symbol} ({pos.quantity})...")
             # Bypass gate and queue for force-close safety
+            # Explicitly mark as urgent and is_pegged=False to force execution
             self.execution.place_order(
                 symbol=pos.symbol,
                 side=side,
                 quantity=abs(pos.quantity),
                 tag="auto_flatten",
                 urgent=True,
+                is_pegged=False,
                 alpha=0.0,
                 rank=50.0
             )

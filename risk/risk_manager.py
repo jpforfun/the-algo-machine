@@ -12,12 +12,14 @@ Method `approve_trade` returns True only if all checks pass.
 """
 
 import logging
+from datetime import datetime, timezone
 from typing import Dict, Optional, List
 from threading import RLock
 
 from config.config import get_settings
 from state.state_manager import StateManager, RiskFlag, Position
 from features.microstructure_features import MicrostructureSnapshot
+from strategy.cross_sectional_ranker import RegimeState
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +46,14 @@ class RiskManager:
         self.max_vol_annualized = self.settings.risk_max_volatility_annualized
         self.min_liquidity_daily = self.settings.risk_min_liquidity_daily_avg
         
+        # Position Sizing Parameters
+        self.base_risk_pct = self.settings.base_risk_per_trade_pct / 100.0
+        self.regime_multipliers = {
+            RegimeState.TRENDING: self.settings.risk_multiplier_trending,
+            RegimeState.CHOPPY: self.settings.risk_multiplier_choppy,
+            RegimeState.HIGH_VOL: self.settings.risk_multiplier_high_vol,
+        }
+        
         # Internal State
         self._peak_daily_pnl = 0.0 # Track peak intraday PnL for trailing drawdown
         
@@ -64,6 +74,65 @@ class RiskManager:
             "TATASTEEL": "Metals", "HINDALCO": "Metals", "JSWSTEEL": "Metals",
             "TATAMOTORS": "Auto", "MARUTI": "Auto", "M&M": "Auto", "EICHERMOT": "Auto"
         }
+    
+    def calculate_position_size(self, 
+                                symbol: str,
+                                regime: RegimeState,
+                                snapshot: MicrostructureSnapshot,
+                                total_capital: float) -> Optional[int]:
+        """
+        Calculate volatility-aware position size.
+        
+        Formula:
+            risk_fraction = base_risk * regime_multiplier
+            position_size = (capital * risk_fraction) / stop_distance
+        
+        Args:
+            symbol: Trading symbol
+            regime: Current market regime
+            snapshot: Market data for volatility estimation
+            total_capital: Available capital
+            
+        Returns:
+            Position size in shares, or None if cannot be computed safely
+        """
+        
+        # Get regime-adjusted risk
+        regime_multiplier = self.regime_multipliers.get(regime, 0.5)
+        risk_fraction = self.base_risk_pct * regime_multiplier
+        
+        # Calculate stop distance
+        # Use ATR proxy: realized_vol_annualized * price * 2.0 (2 standard deviations)
+        if snapshot.realized_vol_annualized <= 0:
+            logger.warning(f"Cannot size {symbol}: Invalid volatility")
+            return None
+        
+        # Stop distance as 2x daily volatility in price units
+        stop_distance = snapshot.last_price * snapshot.realized_vol_annualized * 2.0
+        
+        if stop_distance <= 0:
+            logger.warning(f"Cannot size {symbol}: Invalid stop distance")
+            return None
+        
+        # Calculate size
+        position_value = total_capital * risk_fraction
+        position_size = int(position_value / stop_distance)
+        
+        # Sanity checks
+        if position_size <= 0:
+            logger.warning(f"Cannot size {symbol}: Computed size <= 0")
+            return None
+        
+        # Maximum single position value check
+        max_position_value = self.settings.max_single_order_value
+        actual_value = position_size * snapshot.last_price
+        
+        if actual_value > max_position_value:
+            # Scale down to max value
+            position_size = int(max_position_value / snapshot.last_price)
+            logger.info(f"Position size scaled down for {symbol}: {actual_value:.0f} -> {max_position_value:.0f}")
+        
+        return position_size
 
     def check_circuit_breakers(self) -> bool:
         """
@@ -162,9 +231,42 @@ class RiskManager:
         if not self.check_circuit_breakers():
             return False
             
-        # 2. Urgent Bypass: Allow reduction of risk regardless of size/constraints
+        # 2. Market Data Heartbeat Guard (🛡️ Safety Improvement)
+        # Check staleness of market data snapshot before any other pre-trade check.
+        if snapshot:
+            now_utc = datetime.now(timezone.utc)
+            # Ensure snapshot.timestamp has timezone info or assume UTC
+            ts = snapshot.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            
+            age_sec = (now_utc - ts).total_seconds()
+            threshold = self.settings.market_data_stale_threshold_sec
+            
+            if age_sec > threshold:
+                logger.warning(f"Risk Veto {symbol}: Market data is STALE ({age_sec:.2f}s > {threshold}s). "
+                               f"Heartbeat Guard triggered - Hard Veto.")
+                return False
+
+        # 3. Urgent Bypass: Allow reduction of risk regardless of size/constraints
         if is_urgent:
             return True
+        
+        # 🔴 CRITICAL: REGIME GATE (BLOCK ENTRIES IN CHOPPY)
+        # This check happens early to prevent wasted processing
+        # Note: We need regime state passed in - this will require caller update
+        # For now, we check if snapshot indicates choppy conditions via volatility
+        
+        if side == 'BUY' and snapshot:
+            # Proxy regime check via volatility
+            # If volatility is very low AND spread is very tight, assume choppy
+            # This is a simplified check - proper regime should come from ranker
+            
+            if (snapshot.realized_vol_annualized < 0.005 and  # < 0.5% volatility
+                snapshot.spread_bps < 5.0):  # Very tight spread
+                logger.info(f"Entry blocked for {symbol}: Detected CHOPPY conditions "
+                           f"(vol={snapshot.realized_vol_annualized:.4f}, spread={snapshot.spread_bps:.1f}bps)")
+                return False
 
         # 3. Max Order Value Guard (🛡️ Safety Improvement)
         if snapshot:

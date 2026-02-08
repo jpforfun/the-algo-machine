@@ -4,6 +4,11 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from features.microstructure_features import (
+    MicrostructureSnapshot,
+    MicrostructureFeatureEngine
+)
+
 # Mock config.config before importing ExecutionEngine
 mock_config = MagicMock()
 sys.modules['config.config'] = mock_config
@@ -30,7 +35,9 @@ class TestExecutionEngine(unittest.TestCase):
         self.mock_kite.orders.return_value = []
         
         self.mock_state = MagicMock(spec=StateManager)
+        self.mock_state.is_trading_halted.return_value = False
         self.mock_risk = MagicMock(spec=RiskManager)
+        self.mock_feature_engine = MagicMock(spec=MicrostructureFeatureEngine)
         
         # Setup mock settings returned by get_settings()
         self.mock_settings = MagicMock()
@@ -45,10 +52,17 @@ class TestExecutionEngine(unittest.TestCase):
 
         # Default: Always approve risk
         self.mock_risk.approve_trade.return_value = True
+        
+        # Configure feature engine to return a valid snapshot with numeric values
+        mock_snapshot = MagicMock(spec=MicrostructureSnapshot)
+        mock_snapshot.last_price = 2500.0
+        mock_snapshot.best_bid = 2495.0
+        mock_snapshot.best_ask = 2505.0
+        self.mock_feature_engine.get_snapshot_by_symbol.return_value = mock_snapshot
 
         # We patch the monitor thread to not start during tests
         with patch('threading.Thread'):
-            self.engine = ExecutionEngine(self.mock_kite, self.mock_state, self.mock_risk)
+            self.engine = ExecutionEngine(self.mock_kite, self.mock_state, self.mock_risk, self.mock_feature_engine)
 
     def test_reconciliation_on_startup(self):
         # 1 Managed pegged order, 1 Unmanaged order
@@ -158,6 +172,11 @@ class TestExecutionEngine(unittest.TestCase):
         self.mock_kite.order_history.return_value = [
             {"status": "CANCELLED", "quantity": 10, "filled_quantity": 2}
         ]
+        
+        # Mock quote for fallback order price discovery
+        self.mock_kite.quote.return_value = {
+            "NSE:RELIANCE": {"last_price": 2500.0, "depth": {"buy": [{"price": 2495.0}]}}
+        }
         
         self.engine._check_and_modify_pegged(local_id, all_orders, quotes)
         

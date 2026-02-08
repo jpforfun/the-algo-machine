@@ -34,3 +34,30 @@ pytest*.txt
 # OS generated
 *-shm
 *-wal
+# Environment
+.env*
+!.env.template  # Keep template if sharing
+
+# Documentation
+*.md
+README*.md
+*_REPORT.md
+*_GUIDE.md
+*_DOCS.md
+*_PREVIEW.md
+*_BIBLE.md
+
+# Dashboard - exclude UI/docs but include API
+dashboard/*.html
+dashboard/*.bat
+dashboard/*.md
+!dashboard/dashboard_api.py
+
+# Patches and diagnostics
+patches/
+*_FIX*.*
+diagnose_*.py
+validate_patches.py
+
+# Other temps
+*.template

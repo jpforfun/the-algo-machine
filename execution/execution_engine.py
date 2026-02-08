@@ -89,6 +89,10 @@ class ExecutionEngine:
         self._broker_failure_count = 0  # To track consecutive broker errors (FIXED HARDENING #2)
         self._stop_event = threading.Event()
         
+        # Minimum tick size from config
+        self._tick_size = self.settings.execution_tick_size
+        self._inv_tick = 1.0 / self._tick_size
+        
         # Startup Reconciliation
         self.reconcile_state()
         
@@ -125,6 +129,7 @@ class ExecutionEngine:
                                 "side": order_rec.side.value if hasattr(order_rec.side, 'value') else order_rec.side,
                                 "original_qty": order_rec.quantity,
                                 "remaining_qty": order_rec.quantity - order_rec.filled_quantity,
+                                "last_filled_seen": order_rec.filled_quantity,
                                 "price": order_rec.price,
                                 "start_time": time.time(), # Reset TTL on restart to be safe
                                 "modifications": order_rec.tags.get("mods", 0),
@@ -151,6 +156,12 @@ class ExecutionEngine:
             if elapsed < delay:
                 time.sleep(delay - elapsed)
             self._last_order_time = time.time()
+
+    def _normalize_side(self, side: Union[str, OrderSide]) -> OrderSide:
+        """Ensures side is always an OrderSide enum."""
+        if isinstance(side, OrderSide):
+            return side
+        return OrderSide[side.upper()]
 
     def place_order(self, 
                     symbol: str, 
@@ -188,14 +199,15 @@ class ExecutionEngine:
             return None
 
         # 0.5 Dry-Run Guard (🛡️ Safety Improvement)
+        norm_side = self._normalize_side(side)
         if self.settings.dry_run_mode:
-            logger.info(f"[DRY-RUN] Simulating order placement: {side} {quantity} {symbol} (is_pegged={is_pegged})")
+            logger.info(f"[DRY-RUN] Simulating order placement: {norm_side} {quantity} {symbol} (is_pegged={is_pegged})")
             fake_id = f"SIM_{uuid.uuid4().hex[:10]}"
             # Save a record of the simulated order
             order_rec = Order(
                 order_id=fake_id,
                 symbol=symbol,
-                side=OrderSide.BUY if side == 'BUY' else OrderSide.SELL,
+                side=norm_side,
                 quantity=quantity,
                 filled_quantity=quantity,
                 price=price or (snapshot.last_price if snapshot else 0.0),
@@ -217,7 +229,7 @@ class ExecutionEngine:
         # Re-fetch latest snapshot independently to avoid trusting stale data from Alpha
         current_snap = self.feature_engine.get_snapshot_by_symbol(symbol) or snapshot
         
-        if not self.risk_manager.approve_trade(symbol, side, quantity, current_snap, is_urgent=urgent):
+        if not self.risk_manager.approve_trade(symbol, norm_side.value, quantity, current_snap, is_urgent=urgent):
             logger.warning(f"Execution-side Risk Reject for {symbol}: Market conditions shifted.")
             return None
             
@@ -227,11 +239,11 @@ class ExecutionEngine:
         # Upgrade snapshot reference for internal placement methods
         exec_snap = current_snap 
         if is_pegged and not urgent and self.settings.use_pegged_orders:
-            return self._place_pegged_order(local_id, symbol, side, quantity, tag, exec_snap, alpha, rank)
+            return self._place_pegged_order(local_id, symbol, norm_side, quantity, tag, exec_snap, alpha, rank)
         else:
-            return self._place_marketable_limit(local_id, symbol, side, quantity, price, tag, exec_snap, alpha, rank)
+            return self._place_marketable_limit(local_id, symbol, norm_side, quantity, price, tag, exec_snap, alpha, rank)
 
-    def _place_marketable_limit(self, local_id: str, symbol: str, side: str, 
+    def _place_marketable_limit(self, local_id: str, symbol: str, side: OrderSide, 
                                 quantity: int, price: Optional[float], tag: str,
                                 snapshot: Optional[MicrostructureSnapshot],
                                 alpha: float = 0.0, rank: float = 0.0) -> Optional[str]:
@@ -247,7 +259,7 @@ class ExecutionEngine:
                     ltp = quote[f"NSE:{symbol}"]["last_price"]
                 
                 buffer_pct = self.settings.execution_marketable_limit_buffer_bps / 10000.0
-                if side == 'BUY':
+                if side == OrderSide.BUY:
                     exec_price = ltp * (1 + buffer_pct)
                 else:
                     exec_price = ltp * (1 - buffer_pct)
@@ -259,7 +271,7 @@ class ExecutionEngine:
             order_rec = Order(
                 order_id=local_id,
                 symbol=symbol,
-                side=OrderSide.BUY if side == 'BUY' else OrderSide.SELL,
+                side=side,
                 quantity=quantity,
                 filled_quantity=0,
                 price=exec_price,
@@ -282,7 +294,7 @@ class ExecutionEngine:
                 variety=self.kite.VARIETY_REGULAR,
                 exchange=self.kite.EXCHANGE_NSE,
                 tradingsymbol=symbol,
-                transaction_type=self.kite.TRANSACTION_TYPE_BUY if side == 'BUY' else self.kite.TRANSACTION_TYPE_SELL,
+                transaction_type=self.kite.TRANSACTION_TYPE_BUY if side == OrderSide.BUY else self.kite.TRANSACTION_TYPE_SELL,
                 quantity=quantity,
                 product=self.kite.PRODUCT_MIS if self.settings.trading_mode != "LIVE" else self.kite.PRODUCT_MIS, # Forced to MIS safe default
                 order_type=self.kite.ORDER_TYPE_LIMIT,
@@ -291,7 +303,7 @@ class ExecutionEngine:
             )
             
             self.state_manager.update_order_status(local_id, OrderStatus.OPEN, broker_order_id=str(broker_id))
-            logger.info(f"Marketable Limit placed: {symbol} {side} {quantity} @ {exec_price} "
+            logger.info(f"Marketable Limit placed: {symbol} {side.value} {quantity} @ {exec_price} "
                         f"(Local: {local_id}, Broker: {broker_id})")
             return local_id
 
@@ -308,7 +320,7 @@ class ExecutionEngine:
             self.state_manager.update_order_status(local_id, OrderStatus.REJECTED)
             return None
 
-    def _place_pegged_order(self, local_id: str, symbol: str, side: str, 
+    def _place_pegged_order(self, local_id: str, symbol: str, side: OrderSide, 
                             quantity: int, tag: str, snapshot: Optional[MicrostructureSnapshot],
                             alpha: float = 0.0, rank: float = 0.0) -> Optional[str]:
         """Places a passive limit order and registers it for chasing."""
@@ -316,11 +328,11 @@ class ExecutionEngine:
             # 1. Passive Price Discovery
             best_passive = 0.0
             if snapshot:
-                best_passive = snapshot.best_bid if side == 'BUY' else snapshot.best_ask
+                best_passive = snapshot.best_bid if side == OrderSide.BUY else snapshot.best_ask
             else:
                 quote = self.kite.quote(f"NSE:{symbol}")
                 q_data = quote[f"NSE:{symbol}"]
-                best_passive = q_data["depth"]["buy"][0]["price"] if side == 'BUY' else q_data["depth"]["sell"][0]["price"]
+                best_passive = q_data["depth"]["buy"][0]["price"] if side == OrderSide.BUY else q_data["depth"]["sell"][0]["price"]
             
             if best_passive == 0.0:
                  logger.error(f"Could not determine passive price for {symbol}")
@@ -330,7 +342,7 @@ class ExecutionEngine:
             order_rec = Order(
                 order_id=local_id,
                 symbol=symbol,
-                side=OrderSide.BUY if side == 'BUY' else OrderSide.SELL,
+                side=side,
                 quantity=quantity,
                 filled_quantity=0,
                 price=best_passive,
@@ -353,7 +365,7 @@ class ExecutionEngine:
                 variety=self.kite.VARIETY_REGULAR,
                 exchange=self.kite.EXCHANGE_NSE,
                 tradingsymbol=symbol,
-                transaction_type=self.kite.TRANSACTION_TYPE_BUY if side == 'BUY' else self.kite.TRANSACTION_TYPE_SELL,
+                transaction_type=self.kite.TRANSACTION_TYPE_BUY if side == OrderSide.BUY else self.kite.TRANSACTION_TYPE_SELL,
                 quantity=quantity,
                 product=self.kite.PRODUCT_MIS,
                 order_type=self.kite.ORDER_TYPE_LIMIT,
@@ -371,13 +383,14 @@ class ExecutionEngine:
                     "side": side,
                     "original_qty": quantity,
                     "remaining_qty": quantity,
+                    "last_filled_seen": 0,
                     "price": best_passive,
                     "start_time": time.time(),
                     "modifications": 0,
                     "tag": tag
                 }
             
-            logger.info(f"Pegged Order started: {symbol} {side} @ {best_passive} (Local: {local_id}, Broker: {broker_id})")
+            logger.info(f"Pegged Order started: {symbol} {side.value} @ {best_passive} (Local: {local_id}, Broker: {broker_id})")
             return local_id
 
         except Exception as e:
@@ -389,6 +402,11 @@ class ExecutionEngine:
         """Background loop to manage pegged order lifecycle with batched status checks."""
         while not self._stop_event.is_set():
             try:
+                # Halt Enforcement: Absolute block (🛡️ Safety Improvement)
+                if self.state_manager.is_trading_halted():
+                    time.sleep(5)
+                    continue
+
                 # 1. Collect all local IDs
                 active_ids = []
                 with self._lock:
@@ -449,7 +467,7 @@ class ExecutionEngine:
             p = self._active_pegged_orders[local_id]
             broker_id = p["broker_id"]
             
-            # 1. Sync status and filled quantity
+            # Sync status and filled quantity
             b_order = all_broker_orders.get(broker_id)
             if not b_order:
                 # Order not found in recent history - might be older than poll cycle or broker transient error
@@ -457,6 +475,15 @@ class ExecutionEngine:
                 
             status = b_order.get("status")
             filled = b_order.get("filled_quantity", 0)
+            
+            # Partial Fill Mitigation (🛡️ Safety Improvement)
+            if filled > p["last_filled_seen"]:
+                logger.debug(f"Partial fill detected for {local_id}: {filled} > {p['last_filled_seen']}. Skipping modification this cycle.")
+                p["last_filled_seen"] = filled
+                p["remaining_qty"] = p["original_qty"] - filled
+                self.state_manager.update_order_status(local_id, OrderStatus.PARTIAL_FILL, filled_quantity=filled)
+                return
+
             p["remaining_qty"] = p["original_qty"] - filled
             
             # Sync to DB
@@ -485,7 +512,7 @@ class ExecutionEngine:
                     self._active_pegged_orders.pop(local_id, None)
                 return
 
-            if not self.risk_manager.approve_trade(symbol, side, p["remaining_qty"], current_snap):
+            if not self.risk_manager.approve_trade(symbol, side.value, p["remaining_qty"], current_snap):
                 logger.warning(f"Market shifted against pegged order {local_id}. Triggering fallback.")
                 self._fallback_to_marketable(local_id)
                 return
@@ -503,9 +530,9 @@ class ExecutionEngine:
             if not q_data or "depth" not in q_data:
                 return
                 
-            best_passive = q_data["depth"]["buy"][0]["price"] if side == 'BUY' else q_data["depth"]["sell"][0]["price"]
+            best_passive = q_data["depth"]["buy"][0]["price"] if side == OrderSide.BUY else q_data["depth"]["sell"][0]["price"]
             price_diff = abs(p["price"] - best_passive)
-            if price_diff > 0.04: # More than a tick
+            if price_diff > (self._tick_size * 0.9): # Slightly less than a tick to avoid float issues
                 self._modify_pegged_to_price(local_id, best_passive)
 
     def _modify_pegged_to_price(self, local_id: str, new_price: float):
@@ -536,8 +563,9 @@ class ExecutionEngine:
         logger.info(f"Executing fallback for {local_id} (Broker: {broker_id})")
 
         try:
-            # 1. Request Cancellation
+            # 1. Request Cancellation and Track intent (🛡️ Safety Improvement)
             self._apply_rate_limit()
+            self.state_manager.update_order_status(local_id, OrderStatus.CANCEL_PENDING)
             self.kite.cancel_order(variety=self.kite.VARIETY_REGULAR, order_id=broker_id)
             
             # 2. Wait for final status and recompute remaining balance accurately
@@ -574,11 +602,9 @@ class ExecutionEngine:
 
     def _round_to_tick(self, price: float) -> float:
         """
-        Rounds price to nearest tick.
-        ASSUMPTION: NSE equity tick size = 0.05
-        TODO: Dynamic based on instrument.
+        Rounds price to nearest configured tick size.
         """
-        return round(price * 20) / 20
+        return round(price * self._inv_tick) / self._inv_tick
 
     def stop(self):
         """Gracefully stops the execution monitor."""
