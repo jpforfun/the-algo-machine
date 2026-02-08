@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+pip-wheel-metadata/
+
+# Dependencies/Packages
+**/lib/
+**/site-packages/
+**/node_modules/
+
+# IDE/Cache
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS/Logs
+.DS_Store
+Thumbs.db
+*.log
+
+# Cache/DB/Temp
+.pytest_cache/
+data/*.db*
+test*.db*
+pytest*.txt
+.env
+
+# OS generated
+*-shm
+*-wal
